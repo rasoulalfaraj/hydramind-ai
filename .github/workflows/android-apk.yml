@@ -1,0 +1,149 @@
+name: Build HydraMind Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'lib/**'
+      - 'android/**'
+      - 'assets/**'
+      - 'test/**'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
+      - 'l10n.yaml'
+      - 'analysis_options.yaml'
+      - '.github/workflows/android-apk.yml'
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish the APK as a downloadable GitHub Release
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and build ARM64 APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check complete Flutter source exists
+        shell: bash
+        run: |
+          for required in pubspec.yaml pubspec.lock lib/main.dart android/app/build.gradle.kts assets/fonts/Cairo.ttf; do
+            if [[ ! -f "$required" ]]; then
+              echo "::error file=$required::Flutter project source is missing. Upload the complete source at the repository root; an APK alone cannot be used for a source build."
+              exit 1
+            fi
+          done
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install Android build components
+        shell: bash
+        run: |
+          sdkmanager 'platforms;android-34' 'platforms;android-35' 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+      - name: Set up the verified Flutter toolchain
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.47.9'
+          cache: true
+      - name: Resolve locked dependencies and localization
+        run: |
+          flutter pub get --enforce-lockfile
+          flutter gen-l10n
+      - name: Static analysis
+        run: flutter analyze --no-pub
+      - name: Automated tests
+        run: flutter test --no-pub --reporter expanded
+      - name: Configure optional persistent signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          names = ['ANDROID_KEYSTORE_BASE64', 'ANDROID_STORE_PASSWORD', 'ANDROID_KEY_PASSWORD', 'ANDROID_KEY_ALIAS']
+          values = {name: os.environ.get(name, '') for name in names}
+          if not any(values.values()):
+              print('::notice::No signing secrets supplied. Building an evaluation APK with the runner development key.')
+              raise SystemExit(0)
+          if not all(values.values()):
+              raise SystemExit('All four Android signing secrets must be supplied together.')
+          keystore = Path(os.environ['RUNNER_TEMP']) / 'hydramind-upload.jks'
+          keystore.write_bytes(base64.b64decode(values['ANDROID_KEYSTORE_BASE64'], validate=True))
+          keystore.chmod(0o600)
+          def escaped(value):
+              data = value.encode('utf-16-be')
+              return ''.join('\\u%04x' % int.from_bytes(data[i:i+2], 'big') for i in range(0, len(data), 2))
+          props = {'storeFile': str(keystore), 'storePassword': values['ANDROID_STORE_PASSWORD'], 'keyPassword': values['ANDROID_KEY_PASSWORD'], 'keyAlias': values['ANDROID_KEY_ALIAS']}
+          output = Path('android/key.properties')
+          output.write_text(''.join(key + '=' + escaped(value) + '\n' for key, value in props.items()))
+          output.chmod(0o600)
+          PY
+      - name: Build optimized Android APK
+        run: flutter build apk --release --no-pub --target-platform android-arm64
+      - name: Prepare downloadable APK and checksum
+        shell: bash
+        run: |
+          mkdir -p delivery
+          cp build/app/outputs/flutter-apk/app-release.apk delivery/HydraMind-AI-android-arm64.apk
+          cd delivery
+          sha256sum HydraMind-AI-android-arm64.apk > SHA256SUMS
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HydraMind-AI-Android-arm64
+          path: delivery/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove temporary signing files
+        if: always()
+        shell: bash
+        run: rm -f android/key.properties "$RUNNER_TEMP/hydramind-upload.jks"
+
+  publish:
+    name: Publish optional GitHub Release
+    needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: HydraMind-AI-Android-arm64
+          path: delivery
+      - name: Verify bytes and publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd delivery
+          sha256sum --check SHA256SUMS
+          tag="android-build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          cat > "$RUNNER_TEMP/hydramind-release-notes.md" <<'NOTES'
+          Android ARM64 APK built from this repository by GitHub Actions.
+
+          Download HydraMind-AI-android-arm64.apk under Assets. SHA256SUMS contains its checksum.
+          Android 8.0 or later is required. Without private signing secrets, this is an evaluation build signed with a development key. Native hardware acceptance and production signing remain separate release checks.
+          NOTES
+          gh release create "$tag" HydraMind-AI-android-arm64.apk SHA256SUMS --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "HydraMind AI Android build ${GITHUB_RUN_NUMBER}" --notes-file "$RUNNER_TEMP/hydramind-release-notes.md"
