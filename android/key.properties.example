@@ -1,0 +1,4 @@
+storeFile=/absolute/private/path/hydramind-upload.jks
+storePassword=SET_LOCALLY
+keyPassword=SET_LOCALLY
+keyAlias=hydramind

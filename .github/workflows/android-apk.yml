@@ -19,7 +19,7 @@ on:
         description: Publish the APK as a downloadable GitHub Release
         type: boolean
         required: false
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -122,7 +122,7 @@ jobs:
   publish:
     name: Publish optional GitHub Release
     needs: build
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
